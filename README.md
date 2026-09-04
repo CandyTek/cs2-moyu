@@ -28,7 +28,7 @@ cmake --build build --config Release
 
 监听器只绑定 `127.0.0.1:3000`，不会接收局域网或互联网连接。配置保存在 `%LOCALAPPDATA%\CSMoyu\settings.ini`。
 
-[](doc_img\CSMoyu.webp)
+![](/doc_img/CSMoyu.png)
 
 ## 注意
 
