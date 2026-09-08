@@ -23,6 +23,11 @@ try {
         $window = $process.MainWindowHandle
     }
     if ($window -eq [IntPtr]::Zero) { throw 'GUI window not found' }
+    $pauseMusic = [CSMoyuNativeTest]::GetDlgItem($window, 1009)
+    $pauseVideo = [CSMoyuNativeTest]::GetDlgItem($window, 1010)
+    if ($pauseMusic -eq [IntPtr]::Zero -or $pauseVideo -eq [IntPtr]::Zero) {
+        throw 'Media pause checkboxes not found'
+    }
     $programMode = [CSMoyuNativeTest]::GetDlgItem($window, 1001)
     $target = [CSMoyuNativeTest]::GetDlgItem($window, 1003)
     [void][CSMoyuNativeTest]::SendMessage($programMode, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -31,16 +36,21 @@ try {
     [void][CSMoyuNativeTest]::SendMessage($start, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 500
 
+    $phaseLive = '{"map":{"phase":"live","round":0},"round":{"phase":"live"}}'
     $alive = '{"provider":{"steamid":"local"},"player":{"steamid":"local","activity":"playing","state":{"health":100}}}'
     $dead = '{"provider":{"steamid":"local"},"player":{"steamid":"local","activity":"playing","state":{"health":0}}}'
     $teammateAlive = '{"provider":{"steamid":"local"},"player":{"steamid":"teammate","activity":"playing","state":{"health":100}}}'
     $teammateDead = '{"provider":{"steamid":"local"},"player":{"steamid":"teammate","activity":"playing","state":{"health":0}}}'
-    $first = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -Method Post -ContentType 'application/json' -Body $alive
+    $nextRound = '{"map":{"phase":"live","round":1},"round":{"phase":"freezetime"}}'
+    $gameOver = '{"map":{"phase":"gameover","round":1}}'
+    $warmup = '{"map":{"phase":"warmup","round":0},"round":{"phase":"live"}}'
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/phase' -Method Post -ContentType 'application/json' -Body $phaseLive)
+    $first = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $alive
     $status = [CSMoyuNativeTest]::GetDlgItem($window, 1008)
     $beforeBuffer = New-Object Text.StringBuilder 256
     [void][CSMoyuNativeTest]::GetWindowText($status, $beforeBuffer, $beforeBuffer.Capacity)
     $before = $beforeBuffer.ToString()
-    $second = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -Method Post -ContentType 'application/json' -Body $dead
+    $second = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $dead
     Start-Sleep -Milliseconds 250
 
     $text = New-Object Text.StringBuilder 256
@@ -50,19 +60,50 @@ try {
     [void][CSMoyuNativeTest]::SetWindowText($status, 'teammate-ignore-sentinel')
     $deathStatus = 'teammate-ignore-sentinel'
 
-    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -Method Post -ContentType 'application/json' -Body $teammateAlive)
-    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -Method Post -ContentType 'application/json' -Body $teammateDead)
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $teammateAlive)
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $teammateDead)
     Start-Sleep -Milliseconds 250
     $text.Clear() | Out-Null
     [void][CSMoyuNativeTest]::GetWindowText($status, $text, $text.Capacity)
     if ($text.ToString() -ne $deathStatus) { throw "Teammate death incorrectly changed status: $text" }
 
-    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -Method Post -ContentType 'application/json' -Body $alive)
+    # Restoring health in the same round must not switch back to CS2.
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $alive)
     Start-Sleep -Milliseconds 250
     $text.Clear() | Out-Null
     [void][CSMoyuNativeTest]::GetWindowText($status, $text, $text.Capacity)
-    if ($text.ToString() -eq $deathStatus) { throw "Respawn did not change status: $text" }
-    Write-Output "PASS: own death triggered, teammate death ignored, respawn detected"
+    if ($text.ToString() -ne $deathStatus) { throw "Health recovery incorrectly changed status: $text" }
+
+    # The next round may be reported while spectating a teammate; round phase,
+    # rather than the observed player's health, must trigger the return.
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/phase' -Method Post -ContentType 'application/json' -Body $nextRound)
+    Start-Sleep -Milliseconds 250
+    $text.Clear() | Out-Null
+    [void][CSMoyuNativeTest]::GetWindowText($status, $text, $text.Capacity)
+    if ($text.ToString() -eq $deathStatus) { throw "Next round did not change status: $text" }
+
+    # Verify game-over is the other return condition.
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/phase' -Method Post -ContentType 'application/json' -Body $phaseLive)
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $alive)
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/player' -Method Post -ContentType 'application/json' -Body $dead)
+    Start-Sleep -Milliseconds 250
+    [void][CSMoyuNativeTest]::SetWindowText($status, 'game-over-sentinel')
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/phase' -Method Post -ContentType 'application/json' -Body $gameOver)
+    Start-Sleep -Milliseconds 250
+    $text.Clear() | Out-Null
+    [void][CSMoyuNativeTest]::GetWindowText($status, $text, $text.Capacity)
+    if ($text.ToString() -eq 'game-over-sentinel') { throw "Game over did not change status: $text" }
+
+    # Let the three 400 ms return attempts finish, then verify warmup -> live.
+    Start-Sleep -Milliseconds 1000
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/phase' -Method Post -ContentType 'application/json' -Body $warmup)
+    [void][CSMoyuNativeTest]::SetWindowText($status, 'warmup-sentinel')
+    [void](Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000/phase' -Method Post -ContentType 'application/json' -Body $phaseLive)
+    Start-Sleep -Milliseconds 250
+    $text.Clear() | Out-Null
+    [void][CSMoyuNativeTest]::GetWindowText($status, $text, $text.Capacity)
+    if ($text.ToString() -eq 'warmup-sentinel') { throw "Warmup end did not change status: $text" }
+    Write-Output "PASS: death triggered; health recovery ignored; next round, game over, and warmup end detected"
 }
 finally {
     if (!$process.HasExited) {

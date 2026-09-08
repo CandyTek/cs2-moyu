@@ -7,6 +7,9 @@
 #include <shlobj.h>
 
 #include <atomic>
+#include <algorithm>
+#include <chrono>
+#include <cwctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -23,12 +26,16 @@ constexpr wchar_t kClassName[] = L"CSMoyuWindow";
 constexpr UINT WM_GSI_STATUS = WM_APP + 1;
 constexpr UINT WM_GSI_EVENT = WM_APP + 2;
 constexpr int kPort = 3000;
+constexpr UINT_PTR kReturnToGameTimer = 1;
+constexpr UINT kReturnToGameIntervalMs = 400;
+constexpr int kReturnToGameAttempts = 3;
 
-enum class GsiEvent : WPARAM { Died = 1, Respawned = 2 };
+enum class GsiEvent : WPARAM { Died = 1, RoundStarted = 2, GameEnded = 3, WarmupEnded = 4 };
+enum class ReturnReason { RoundStarted, GameEnded, WarmupEnded };
 
 enum ControlId {
     IDC_MODE_PROGRAM = 1001, IDC_MODE_HOTKEY, IDC_TARGET, IDC_BROWSE,
-    IDC_HOTKEY, IDC_START, IDC_INSTALL, IDC_STATUS
+    IDC_HOTKEY, IDC_START, IDC_INSTALL, IDC_STATUS, IDC_PAUSE_MUSIC, IDC_PAUSE_VIDEO
 };
 
 struct Settings {
@@ -37,11 +44,14 @@ struct Settings {
     std::wstring cs2Path;
     UINT key = VK_TAB;
     bool ctrl = false, alt = true, shift = false, win = false;
+    bool pauseMusic = false;
+    bool pauseVideo = false;
 };
 
 struct AppState {
     HWND window{};
     HWND modeProgram{}, modeHotkey{}, target{}, browse{}, hotkey{}, start{}, install{}, status{};
+    HWND pauseMusic{}, pauseVideo{};
     HFONT font{}, titleFont{};
     HBRUSH background{};
     Settings settings;
@@ -50,7 +60,14 @@ struct AppState {
     std::thread serverThread;
     std::atomic<SOCKET> listenSocket{INVALID_SOCKET};
     int ownPreviousHealth = -1;
-    bool waitingForRespawn = false;
+    bool waitingForNextRound = false;
+    std::optional<int> deathRound;
+    std::optional<int> observedRound;
+    std::string previousRoundPhase;
+    std::string previousMapPhase;
+    std::chrono::steady_clock::time_point lastPayloadHandled{};
+    int returnToGameAttemptsRemaining = 0;
+    ReturnReason returnReason = ReturnReason::RoundStarted;
     bool capturing = false;
     WNDPROC oldHotkeyProc{};
     std::wstring iniPath;
@@ -84,6 +101,8 @@ void LoadSettings() {
     g.settings.alt = GetPrivateProfileIntW(L"hotkey", L"alt", 1, g.iniPath.c_str()) != 0;
     g.settings.shift = GetPrivateProfileIntW(L"hotkey", L"shift", 0, g.iniPath.c_str()) != 0;
     g.settings.win = GetPrivateProfileIntW(L"hotkey", L"win", 0, g.iniPath.c_str()) != 0;
+    g.settings.pauseMusic = GetPrivateProfileIntW(L"media", L"pause_music", 0, g.iniPath.c_str()) != 0;
+    g.settings.pauseVideo = GetPrivateProfileIntW(L"media", L"pause_video", 0, g.iniPath.c_str()) != 0;
 }
 
 void SaveSettings() {
@@ -99,6 +118,8 @@ void SaveSettings() {
     writeInt(L"hotkey", L"alt", g.settings.alt);
     writeInt(L"hotkey", L"shift", g.settings.shift);
     writeInt(L"hotkey", L"win", g.settings.win);
+    writeInt(L"media", L"pause_music", g.settings.pauseMusic);
+    writeInt(L"media", L"pause_video", g.settings.pauseVideo);
 }
 
 std::wstring KeyName(UINT vk) {
@@ -131,6 +152,8 @@ void RefreshControls() {
     EnableWindow(g.target, g.settings.programMode);
     EnableWindow(g.browse, g.settings.programMode);
     EnableWindow(g.hotkey, !g.settings.programMode);
+    SendMessageW(g.pauseMusic, BM_SETCHECK, g.settings.pauseMusic ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g.pauseVideo, BM_SETCHECK, g.settings.pauseVideo ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 bool IsModifier(UINT vk) {
@@ -223,6 +246,36 @@ std::optional<std::string> StringForKey(const std::string& json, const std::stri
 }
 
 void HandlePayload(const std::string& json) {
+    const auto map = ObjectForKey(json, "map");
+    const auto round = ObjectForKey(json, "round");
+    const auto mapPhase = map ? StringForKey(*map, "phase") : std::nullopt;
+    const auto currentRound = map ? IntForKey(*map, "round") : std::nullopt;
+    const auto roundPhase = round ? StringForKey(*round, "phase") : std::nullopt;
+    if (currentRound) g.observedRound = currentRound;
+
+    const bool warmupEnded = mapPhase && *mapPhase == "live" && g.previousMapPhase == "warmup";
+    if (warmupEnded) {
+        g.waitingForNextRound = false;
+        g.deathRound.reset();
+        PostMessageW(g.window, WM_GSI_EVENT, static_cast<WPARAM>(GsiEvent::WarmupEnded), 0);
+    } else if (g.waitingForNextRound) {
+        const bool gameEnded = mapPhase && *mapPhase == "gameover";
+        const bool enteredFreezeTime = roundPhase && *roundPhase == "freezetime" &&
+            g.previousRoundPhase != "freezetime";
+        // If freezetime was missed, a higher map.round combined with "live" still
+        // proves that play has moved on to the next round.
+        const bool nextRoundAlreadyLive = g.deathRound && currentRound &&
+            *currentRound > *g.deathRound && roundPhase && *roundPhase == "live";
+        if (gameEnded || enteredFreezeTime || nextRoundAlreadyLive) {
+            g.waitingForNextRound = false;
+            g.deathRound.reset();
+            PostMessageW(g.window, WM_GSI_EVENT,
+                static_cast<WPARAM>(gameEnded ? GsiEvent::GameEnded : GsiEvent::RoundStarted), 0);
+        }
+    }
+    if (roundPhase) g.previousRoundPhase = *roundPhase;
+    if (mapPhase) g.previousMapPhase = *mapPhase;
+
     const auto provider = ObjectForKey(json, "provider");
     const auto player = ObjectForKey(json, "player");
     if (!provider || !player) return;
@@ -239,18 +292,38 @@ void HandlePayload(const std::string& json) {
     if (activity && *activity != "playing") return;
 
     if (*health == 0) {
-        if (g.ownPreviousHealth > 0 && !g.waitingForRespawn) {
-            g.waitingForRespawn = true;
+        if (g.ownPreviousHealth > 0 && !g.waitingForNextRound) {
+            g.waitingForNextRound = true;
+            g.deathRound = currentRound ? currentRound : g.observedRound;
             PostMessageW(g.window, WM_GSI_EVENT, static_cast<WPARAM>(GsiEvent::Died), 0);
         }
         g.ownPreviousHealth = 0;
     } else {
-        if (g.waitingForRespawn) {
-            g.waitingForRespawn = false;
-            PostMessageW(g.window, WM_GSI_EVENT, static_cast<WPARAM>(GsiEvent::Respawned), 0);
-        }
         g.ownPreviousHealth = *health;
     }
+}
+
+bool IsZeroHealthPayload(const std::string& json) {
+    const auto player = ObjectForKey(json, "player");
+    if (!player) return false;
+    const auto state = ObjectForKey(*player, "state");
+    const auto health = state ? IntForKey(*state, "health") : std::nullopt;
+    return health && *health == 0;
+}
+
+void HandlePayloadAtAdaptiveRate(const std::string& json) {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    constexpr auto aliveInterval = seconds(1);
+
+    // GSI pushes data to us. While alive, avoid repeatedly parsing noisy player
+    // state; a death packet is never delayed. Once dead, inspect every update so
+    // the next round/game-over transition is noticed promptly.
+    const bool phaseOnlyPayload = !ObjectForKey(json, "player");
+    if (!phaseOnlyPayload && !g.waitingForNextRound && g.ownPreviousHealth >= 0 &&
+        now - g.lastPayloadHandled < aliveInterval && !IsZeroHealthPayload(json)) return;
+    g.lastPayloadHandled = now;
+    HandlePayload(json);
 }
 
 bool SendAll(SOCKET socket, const char* data, int size) {
@@ -314,7 +387,7 @@ void ServerLoop() {
         SendAll(client, response, static_cast<int>(sizeof(response) - 1));
         closesocket(client);
         const size_t body = request.find("\r\n\r\n");
-        if (body != std::string::npos) HandlePayload(request.substr(body + 4));
+        if (body != std::string::npos) HandlePayloadAtAdaptiveRate(request.substr(body + 4));
     }
     const SOCKET ownedSocket = g.listenSocket.exchange(INVALID_SOCKET);
     if (ownedSocket != INVALID_SOCKET) closesocket(ownedSocket);
@@ -326,7 +399,12 @@ void StartServer() {
     if (g.serverThread.joinable()) g.serverThread.join();
     g.stopRequested = false;
     g.ownPreviousHealth = -1;
-    g.waitingForRespawn = false;
+    g.waitingForNextRound = false;
+    g.deathRound.reset();
+    g.observedRound.reset();
+    g.previousRoundPhase.clear();
+    g.previousMapPhase.clear();
+    g.lastPayloadHandled = {};
     g.listening = true;
     SetWindowTextW(g.start, L"停止监听");
     g.serverThread = std::thread(ServerLoop);
@@ -339,6 +417,8 @@ void StopServer() {
     if (socket != INVALID_SOCKET) closesocket(socket);
     if (g.serverThread.joinable()) g.serverThread.join();
     g.listening = false;
+    KillTimer(g.window, kReturnToGameTimer);
+    g.returnToGameAttemptsRemaining = 0;
     SetWindowTextW(g.start, L"开始监听");
     SetStatus(L"已停止");
 }
@@ -383,6 +463,84 @@ bool ActivateWindow(HWND hwnd) {
     return GetForegroundWindow() == hwnd;
 }
 
+std::wstring Lowercase(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+        [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+    return text;
+}
+
+std::wstring WindowProcessName(HWND hwnd) {
+    DWORD pid{};
+    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return {};
+    wchar_t path[32768]{};
+    DWORD size = 32768;
+    const bool ok = QueryFullProcessImageNameW(process, 0, path, &size) != FALSE;
+    CloseHandle(process);
+    return ok ? Lowercase(fs::path(path).filename().wstring()) : std::wstring{};
+}
+
+bool IsMusicPlayer(const std::wstring& process) {
+    static constexpr const wchar_t* names[] = {
+        L"cloudmusic.exe", L"qqmusic.exe", L"kugou.exe", L"kuwo.exe",
+        L"spotify.exe", L"music.ui.exe", L"microsoft.media.player.exe",
+        L"foobar2000.exe", L"aimp.exe"
+    };
+    for (const auto* name : names) if (process == name) return true;
+    return false;
+}
+
+bool IsBrowser(const std::wstring& process) {
+    static constexpr const wchar_t* names[] = {
+        L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe",
+        L"opera.exe", L"vivaldi.exe", L"360chrome.exe", L"qqbrowser.exe"
+    };
+    for (const auto* name : names) if (process == name) return true;
+    return false;
+}
+
+bool IsSupportedVideoTitle(HWND hwnd) {
+    wchar_t title[1024]{};
+    GetWindowTextW(hwnd, title, 1024);
+    const std::wstring text = Lowercase(title);
+    static constexpr const wchar_t* markers[] = {
+        L"哔哩哔哩", L"bilibili", L"抖音", L"douyin", L"西瓜视频", L"ixigua"
+    };
+    for (const auto* marker : markers) {
+        if (text.find(marker) != std::wstring::npos) return true;
+    }
+    return false;
+}
+
+struct PauseMediaData {
+    bool music;
+    bool video;
+};
+
+BOOL CALLBACK PauseMediaWindow(HWND hwnd, LPARAM param) {
+    auto* data = reinterpret_cast<PauseMediaData*>(param);
+    if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER)) return TRUE;
+    const std::wstring process = WindowProcessName(hwnd);
+    const bool musicTarget = data->music && IsMusicPlayer(process);
+    const bool videoTarget = data->video && IsBrowser(process) && IsSupportedVideoTitle(hwnd);
+    if (!musicTarget && !videoTarget) return TRUE;
+
+    // MEDIA_PAUSE is idempotent: unlike the play/pause toggle, it will not
+    // accidentally start a session that was already paused.
+    DWORD_PTR ignored{};
+    SendMessageTimeoutW(hwnd, WM_APPCOMMAND, reinterpret_cast<WPARAM>(g.window),
+        MAKELPARAM(0, APPCOMMAND_MEDIA_PAUSE | FAPPCOMMAND_KEY),
+        SMTO_ABORTIFHUNG, 250, &ignored);
+    return TRUE;
+}
+
+void PauseSelectedMedia() {
+    if (!g.settings.pauseMusic && !g.settings.pauseVideo) return;
+    PauseMediaData data{g.settings.pauseMusic, g.settings.pauseVideo};
+    EnumWindows(PauseMediaWindow, reinterpret_cast<LPARAM>(&data));
+}
+
 void SendConfiguredHotkey() {
     std::vector<INPUT> inputs;
     auto add = [&](WORD vk, bool up) {
@@ -405,6 +563,7 @@ void SendConfiguredHotkey() {
 }
 
 void TriggerAction() {
+    PauseSelectedMedia();
     if (g.settings.programMode) {
         if (g.settings.target.empty()) {
             SetStatus(L"检测到死亡，但尚未选择目标程序");
@@ -436,14 +595,39 @@ HWND FindCs2Window() {
     return byName.result;
 }
 
-void ReturnToGame() {
+const wchar_t* ReturnReasonText(ReturnReason reason) {
+    switch (reason) {
+    case ReturnReason::GameEnded: return L"检测到游戏结束";
+    case ReturnReason::WarmupEnded: return L"检测到热身结束";
+    default: return L"检测到下一回合开始";
+    }
+}
+
+void AttemptReturnToGame() {
+    if (g.returnToGameAttemptsRemaining <= 0) {
+        KillTimer(g.window, kReturnToGameTimer);
+        return;
+    }
+    --g.returnToGameAttemptsRemaining;
     const HWND cs2 = FindCs2Window();
     if (cs2) {
         ActivateWindow(cs2);
-        SetStatus(L"检测到复活 · 已切换回 CS2");
+        SetStatus(std::wstring(ReturnReasonText(g.returnReason)) + L" · 已切换回 CS2");
     } else {
-        SetStatus(L"检测到复活，但未找到 CS2 窗口");
+        SetStatus(std::wstring(ReturnReasonText(g.returnReason)) + L"，但未找到 CS2 窗口");
     }
+    if (g.returnToGameAttemptsRemaining > 0) {
+        SetTimer(g.window, kReturnToGameTimer, kReturnToGameIntervalMs, nullptr);
+    } else {
+        KillTimer(g.window, kReturnToGameTimer);
+    }
+}
+
+void ReturnToGame(ReturnReason reason) {
+    KillTimer(g.window, kReturnToGameTimer);
+    g.returnReason = reason;
+    g.returnToGameAttemptsRemaining = kReturnToGameAttempts;
+    AttemptReturnToGame();
 }
 
 void BrowseTarget() {
@@ -473,27 +657,44 @@ bool WriteGsiConfig(const fs::path& cs2Exe, std::wstring& result) {
         return false;
     }
     const fs::path cfgDir = game / L"csgo" / L"cfg";
-    const fs::path cfgFile = cfgDir / L"gamestate_integration_csmoyu.cfg";
+    const fs::path playerCfgFile = cfgDir / L"gamestate_integration_csmoyu.cfg";
+    const fs::path phaseCfgFile = cfgDir / L"gamestate_integration_csmoyu_phase.cfg";
     std::error_code ec;
     fs::create_directories(cfgDir, ec);
-    std::ofstream file(cfgFile, std::ios::binary | std::ios::trunc);
-    if (!file) {
-        result = L"无法写入：" + cfgFile.wstring() + L"\n请检查目录权限。";
+    std::ofstream playerFile(playerCfgFile, std::ios::binary | std::ios::trunc);
+    std::ofstream phaseFile(phaseCfgFile, std::ios::binary | std::ios::trunc);
+    if (!playerFile || !phaseFile) {
+        result = L"无法写入 GSI 配置：\n" + cfgDir.wstring() + L"\n请检查目录权限。";
         return false;
     }
-    file << "\"CSMoyu Integration\"\n{\n"
-            "  \"uri\" \"http://127.0.0.1:3000\"\n"
+    // Player state can be noisy (for example while flashed), so cap it at 1 Hz.
+    // A separate, narrow phase stream keeps round transitions responsive without
+    // repeatedly serializing all player state at 10 Hz.
+    playerFile << "\"CSMoyu Player Integration\"\n{\n"
+            "  \"uri\" \"http://127.0.0.1:3000/player\"\n"
             "  \"timeout\" \"1.0\"\n"
             "  \"buffer\" \"0.0\"\n"
-            "  \"throttle\" \"0.1\"\n"
-            "  \"heartbeat\" \"10.0\"\n"
+            "  \"throttle\" \"1.0\"\n"
+            "  \"heartbeat\" \"30.0\"\n"
             "  \"data\"\n  {\n"
             "    \"provider\" \"1\"\n"
             "    \"player_id\" \"1\"\n"
             "    \"player_state\" \"1\"\n"
             "  }\n}\n";
-    file.close();
-    result = L"配置已安装：\n" + cfgFile.wstring() + L"\n\n如果 CS2 正在运行，请重启游戏。";
+    phaseFile << "\"CSMoyu Phase Integration\"\n{\n"
+            "  \"uri\" \"http://127.0.0.1:3000/phase\"\n"
+            "  \"timeout\" \"1.0\"\n"
+            "  \"buffer\" \"0.0\"\n"
+            "  \"throttle\" \"0.1\"\n"
+            "  \"heartbeat\" \"30.0\"\n"
+            "  \"data\"\n  {\n"
+            "    \"map\" \"1\"\n"
+            "    \"round\" \"1\"\n"
+            "  }\n}\n";
+    playerFile.close();
+    phaseFile.close();
+    result = L"配置已安装：\n" + playerCfgFile.wstring() + L"\n" + phaseCfgFile.wstring() +
+        L"\n\n如果 CS2 正在运行，请重启游戏。";
     return true;
 }
 
@@ -548,9 +749,15 @@ void CreateUi(HWND hwnd) {
     AddControl(L"STATIC", L"目标程序已运行时切换窗口，否则启动它。", SS_LEFT, 42, 196, 450, 20, 0);
     g.hotkey = AddControl(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY | WS_BORDER | WS_TABSTOP, 42, 226, 492, 30, IDC_HOTKEY);
 
-    g.install = AddControl(L"BUTTON", L"安装 CS2 监听配置…", BS_PUSHBUTTON | WS_TABSTOP, 22, 291, 202, 38, IDC_INSTALL);
-    g.start = AddControl(L"BUTTON", L"开始监听", BS_DEFPUSHBUTTON | WS_TABSTOP, 356, 291, 202, 38, IDC_START);
-    g.status = AddControl(L"STATIC", L"尚未开始", SS_LEFT | SS_CENTERIMAGE, 28, 348, 520, 28, IDC_STATUS);
+    AddControl(L"BUTTON", L" 死亡时暂停媒体 ", BS_GROUPBOX, 22, 286, 536, 72, 0);
+    g.pauseMusic = AddControl(L"BUTTON", L"暂停音乐播放器", BS_AUTOCHECKBOX | WS_TABSTOP,
+        42, 312, 160, 24, IDC_PAUSE_MUSIC);
+    g.pauseVideo = AddControl(L"BUTTON", L"暂停网页视频（哔哩哔哩 / 抖音 / 西瓜视频）",
+        BS_AUTOCHECKBOX | WS_TABSTOP, 218, 312, 320, 24, IDC_PAUSE_VIDEO);
+
+    g.install = AddControl(L"BUTTON", L"安装 CS2 监听配置…", BS_PUSHBUTTON | WS_TABSTOP, 22, 376, 202, 38, IDC_INSTALL);
+    g.start = AddControl(L"BUTTON", L"开始监听", BS_DEFPUSHBUTTON | WS_TABSTOP, 356, 376, 202, 38, IDC_START);
+    g.status = AddControl(L"STATIC", L"尚未开始", SS_LEFT | SS_CENTERIMAGE, 28, 433, 520, 28, IDC_STATUS);
 
     g.oldHotkeyProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g.hotkey, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HotkeyProc)));
     RefreshControls();
@@ -574,6 +781,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
             g.settings.programMode = id == IDC_MODE_PROGRAM;
             SaveSettings(); RefreshControls(); return 0;
         }
+        if (id == IDC_PAUSE_MUSIC || id == IDC_PAUSE_VIDEO) {
+            g.settings.pauseMusic = SendMessageW(g.pauseMusic, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            g.settings.pauseVideo = SendMessageW(g.pauseVideo, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            SaveSettings(); return 0;
+        }
         if (id == IDC_BROWSE) { BrowseTarget(); return 0; }
         if (id == IDC_INSTALL) { InstallConfig(); return 0; }
         if (id == IDC_START) {
@@ -592,8 +804,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_GSI_EVENT:
         if (static_cast<GsiEvent>(wp) == GsiEvent::Died) TriggerAction();
-        else if (static_cast<GsiEvent>(wp) == GsiEvent::Respawned) ReturnToGame();
+        else if (static_cast<GsiEvent>(wp) == GsiEvent::RoundStarted) ReturnToGame(ReturnReason::RoundStarted);
+        else if (static_cast<GsiEvent>(wp) == GsiEvent::GameEnded) ReturnToGame(ReturnReason::GameEnded);
+        else if (static_cast<GsiEvent>(wp) == GsiEvent::WarmupEnded) ReturnToGame(ReturnReason::WarmupEnded);
         return 0;
+    case WM_TIMER:
+        if (wp == kReturnToGameTimer) {
+            AttemptReturnToGame();
+            return 0;
+        }
+        break;
     case WM_GSI_STATUS: {
         auto* text = reinterpret_cast<std::wstring*>(lp);
         SetStatus(*text); delete text;
@@ -626,7 +846,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     cls.lpszClassName = kClassName;
     if (!RegisterClassExW(&cls)) return 1;
 
-    RECT desired{0, 0, 580, 420};
+    RECT desired{0, 0, 580, 505};
     AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
     HWND window = CreateWindowExW(0, kClassName, L"CS2 摸鱼切换器",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
