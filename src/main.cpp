@@ -5,6 +5,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <algorithm>
@@ -23,6 +24,7 @@
 namespace fs = std::filesystem;
 
 constexpr wchar_t kClassName[] = L"CSMoyuWindow";
+constexpr wchar_t kHelpClassName[] = L"CSMoyuHelpWindow";
 constexpr UINT WM_GSI_STATUS = WM_APP + 1;
 constexpr UINT WM_GSI_EVENT = WM_APP + 2;
 constexpr int kPort = 3000;
@@ -35,7 +37,8 @@ enum class ReturnReason { RoundStarted, GameEnded, WarmupEnded };
 
 enum ControlId {
     IDC_MODE_PROGRAM = 1001, IDC_MODE_HOTKEY, IDC_TARGET, IDC_BROWSE,
-    IDC_HOTKEY, IDC_START, IDC_INSTALL, IDC_STATUS, IDC_PAUSE_MUSIC, IDC_PAUSE_VIDEO
+    IDC_HOTKEY, IDC_START, IDC_INSTALL, IDC_STATUS, IDC_PAUSE_MUSIC, IDC_PAUSE_VIDEO,
+    IDC_HELP_BUTTON
 };
 
 struct Settings {
@@ -50,6 +53,7 @@ struct Settings {
 
 struct AppState {
     HWND window{};
+    HWND helpWindow{};
     HWND modeProgram{}, modeHotkey{}, target{}, browse{}, hotkey{}, start{}, install{}, status{};
     HWND pauseMusic{}, pauseVideo{};
     HFONT font{}, titleFont{};
@@ -120,6 +124,24 @@ void SaveSettings() {
     writeInt(L"hotkey", L"win", g.settings.win);
     writeInt(L"media", L"pause_music", g.settings.pauseMusic);
     writeInt(L"media", L"pause_video", g.settings.pauseVideo);
+}
+
+void SaveUiSettings() {
+    if (g.modeProgram && SendMessageW(g.modeProgram, BM_GETCHECK, 0, 0) == BST_CHECKED)
+        g.settings.programMode = true;
+    else if (g.modeHotkey && SendMessageW(g.modeHotkey, BM_GETCHECK, 0, 0) == BST_CHECKED)
+        g.settings.programMode = false;
+
+    if (g.target) {
+        std::vector<wchar_t> target(static_cast<size_t>(GetWindowTextLengthW(g.target)) + 1);
+        GetWindowTextW(g.target, target.data(), static_cast<int>(target.size()));
+        g.settings.target = target.data();
+    }
+    if (g.pauseMusic)
+        g.settings.pauseMusic = SendMessageW(g.pauseMusic, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (g.pauseVideo)
+        g.settings.pauseVideo = SendMessageW(g.pauseVideo, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    SaveSettings();
 }
 
 std::wstring KeyName(UINT vk) {
@@ -645,6 +667,167 @@ void BrowseTarget() {
     }
 }
 
+bool IsCs2Exe(const fs::path& path) {
+    std::error_code ec;
+    return _wcsicmp(path.filename().c_str(), L"cs2.exe") == 0 && fs::is_regular_file(path, ec);
+}
+
+void AddUniquePath(std::vector<fs::path>& paths, const fs::path& path) {
+    if (path.empty()) return;
+    const std::wstring value = path.lexically_normal().wstring();
+    for (const auto& existing : paths) {
+        if (_wcsicmp(existing.lexically_normal().c_str(), value.c_str()) == 0) return;
+    }
+    paths.emplace_back(value);
+}
+
+std::optional<std::wstring> ReadRegistryString(HKEY root, const wchar_t* subkey,
+                                               const wchar_t* value, REGSAM view = 0) {
+    HKEY key{};
+    if (RegOpenKeyExW(root, subkey, 0, KEY_QUERY_VALUE | view, &key) != ERROR_SUCCESS) return std::nullopt;
+    DWORD type = 0, bytes = 0;
+    const LONG sizeResult = RegQueryValueExW(key, value, nullptr, &type, nullptr, &bytes);
+    if (sizeResult != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || bytes < sizeof(wchar_t)) {
+        RegCloseKey(key);
+        return std::nullopt;
+    }
+    std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 1);
+    const LONG readResult = RegQueryValueExW(key, value, nullptr, &type,
+        reinterpret_cast<BYTE*>(buffer.data()), &bytes);
+    RegCloseKey(key);
+    if (readResult != ERROR_SUCCESS) return std::nullopt;
+    buffer.back() = L'\0';
+    std::wstring result = buffer.data();
+    if (type == REG_EXPAND_SZ) {
+        const DWORD needed = ExpandEnvironmentStringsW(result.c_str(), nullptr, 0);
+        if (needed) {
+            std::vector<wchar_t> expanded(needed);
+            if (ExpandEnvironmentStringsW(result.c_str(), expanded.data(), needed)) result = expanded.data();
+        }
+    }
+    return result;
+}
+
+std::wstring Utf8ToWide(const std::string& text) {
+    if (text.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (!size) return {};
+    std::wstring result(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size);
+    return result;
+}
+
+std::vector<std::wstring> QuotedVdfValues(const std::wstring& line) {
+    std::vector<std::wstring> values;
+    for (size_t start = 0; start < line.size();) {
+        start = line.find(L'"', start);
+        if (start == std::wstring::npos) break;
+        std::wstring value;
+        bool closed = false;
+        for (size_t i = start + 1; i < line.size(); ++i) {
+            if (line[i] == L'"') { values.push_back(value); start = i + 1; closed = true; break; }
+            if (line[i] == L'\\' && i + 1 < line.size() && line[i + 1] == L'\\') ++i;
+            value.push_back(line[i]);
+        }
+        if (!closed) break;
+    }
+    return values;
+}
+
+std::wstring ReadTextFileUtf8(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return {};
+    return Utf8ToWide(std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()));
+}
+
+std::optional<fs::path> RunningCs2Path() {
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return std::nullopt;
+    PROCESSENTRY32W entry{sizeof(entry)};
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsicmp(entry.szExeFile, L"cs2.exe") != 0) continue;
+            const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+            if (!process) continue;
+            std::vector<wchar_t> path(32768);
+            DWORD size = static_cast<DWORD>(path.size());
+            const bool found = QueryFullProcessImageNameW(process, 0, path.data(), &size) != FALSE;
+            CloseHandle(process);
+            if (found) {
+                CloseHandle(snapshot);
+                fs::path result(std::wstring(path.data(), size));
+                if (IsCs2Exe(result)) return result;
+                return std::nullopt;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return std::nullopt;
+}
+
+std::optional<fs::path> Cs2InSteamLibrary(const fs::path& library) {
+    const fs::path steamapps = library / L"steamapps";
+    std::wstring installDir = L"Counter-Strike Global Offensive";
+    const std::wstring manifest = ReadTextFileUtf8(steamapps / L"appmanifest_730.acf");
+    if (!manifest.empty()) {
+        size_t lineStart = 0;
+        while (lineStart < manifest.size()) {
+            const size_t lineEnd = manifest.find_first_of(L"\r\n", lineStart);
+            const auto values = QuotedVdfValues(manifest.substr(lineStart, lineEnd - lineStart));
+            if (values.size() >= 2 && _wcsicmp(values[0].c_str(), L"installdir") == 0) {
+                installDir = values[1];
+                break;
+            }
+            if (lineEnd == std::wstring::npos) break;
+            lineStart = lineEnd + 1;
+        }
+    }
+    const fs::path candidate = steamapps / L"common" / installDir / L"game" / L"bin" / L"win64" / L"cs2.exe";
+    if (IsCs2Exe(candidate)) return candidate;
+    return std::nullopt;
+}
+
+std::optional<fs::path> DetectCs2Path() {
+    if (IsCs2Exe(g.settings.cs2Path)) return fs::path(g.settings.cs2Path);
+    if (const auto running = RunningCs2Path()) return running;
+
+    std::vector<fs::path> steamRoots;
+    for (const auto& entry : {
+        ReadRegistryString(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath"),
+        ReadRegistryString(HKEY_LOCAL_MACHINE, L"Software\\Valve\\Steam", L"InstallPath", KEY_WOW64_32KEY),
+        ReadRegistryString(HKEY_LOCAL_MACHINE, L"Software\\Valve\\Steam", L"InstallPath", KEY_WOW64_64KEY)}) {
+        if (entry) AddUniquePath(steamRoots, *entry);
+    }
+    wchar_t programFiles[32768]{};
+    if (GetEnvironmentVariableW(L"ProgramFiles(x86)", programFiles, 32768))
+        AddUniquePath(steamRoots, fs::path(programFiles) / L"Steam");
+    if (GetEnvironmentVariableW(L"ProgramFiles", programFiles, 32768))
+        AddUniquePath(steamRoots, fs::path(programFiles) / L"Steam");
+
+    std::vector<fs::path> libraries = steamRoots;
+    for (const auto& root : steamRoots) {
+        const std::wstring vdf = ReadTextFileUtf8(root / L"steamapps" / L"libraryfolders.vdf");
+        size_t lineStart = 0;
+        while (lineStart < vdf.size()) {
+            const size_t lineEnd = vdf.find_first_of(L"\r\n", lineStart);
+            const auto values = QuotedVdfValues(vdf.substr(lineStart, lineEnd - lineStart));
+            if (values.size() >= 2) {
+                const bool newFormat = _wcsicmp(values[0].c_str(), L"path") == 0;
+                const bool oldFormat = !values[0].empty() &&
+                    std::all_of(values[0].begin(), values[0].end(), [](wchar_t c) { return iswdigit(c) != 0; }) &&
+                    values[1].find_first_of(L"\\/") != std::wstring::npos;
+                if (newFormat || oldFormat) AddUniquePath(libraries, values[1]);
+            }
+            if (lineEnd == std::wstring::npos) break;
+            lineStart = lineEnd + 1;
+        }
+    }
+    for (const auto& library : libraries) {
+        if (const auto result = Cs2InSteamLibrary(library)) return result;
+    }
+    return std::nullopt;
+}
+
 bool WriteGsiConfig(const fs::path& cs2Exe, std::wstring& result) {
     fs::path current = cs2Exe.parent_path();
     fs::path game;
@@ -699,6 +882,27 @@ bool WriteGsiConfig(const fs::path& cs2Exe, std::wstring& result) {
 }
 
 void InstallConfig() {
+    if (const auto detected = DetectCs2Path()) {
+        const std::wstring question = L"已自动检测到 CS2：\n\n" + detected->wstring() +
+            L"\n\n是否使用此位置安装监听配置？\n选择“否”可手动选择其他 cs2.exe。";
+        const int choice = MessageBoxW(g.window, question.c_str(), L"检测到 CS2", MB_YESNOCANCEL | MB_ICONQUESTION);
+        if (choice == IDCANCEL) return;
+        if (choice == IDYES) {
+            std::wstring message;
+            const bool ok = WriteGsiConfig(*detected, message);
+            if (ok) {
+                g.settings.cs2Path = detected->wstring();
+                SaveSettings();
+            }
+            MessageBoxW(g.window, message.c_str(), ok ? L"安装完成" : L"安装失败",
+                ok ? MB_ICONINFORMATION : MB_ICONERROR);
+            return;
+        }
+    } else {
+        MessageBoxW(g.window, L"未能从正在运行的进程或 Steam 游戏库自动找到 CS2。\n接下来请手动选择 cs2.exe。",
+            L"未检测到 CS2", MB_OK | MB_ICONINFORMATION);
+    }
+
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{sizeof(dialog)};
     dialog.hwndOwner = g.window;
@@ -716,6 +920,60 @@ void InstallConfig() {
         }
         MessageBoxW(g.window, message.c_str(), ok ? L"安装完成" : L"安装失败", ok ? MB_ICONINFORMATION : MB_ICONERROR);
     }
+}
+
+LRESULT CALLBACK HelpWindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_CREATE: {
+        HWND heading = CreateWindowExW(0, L"STATIC", L"帮助与使用说明", WS_CHILD | WS_VISIBLE,
+            24, 20, 500, 32, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(g.titleFont), TRUE);
+        constexpr wchar_t helpText[] =
+            L"合规说明\r\n"
+            L"本程序只使用 Valve 公开提供的 Game State Integration（GSI）接收本机游戏状态，"
+            L"不会注入或修改 CS2，不读取游戏内存，不自动瞄准、移动或射击，也不绕过 VAC。"
+            L"从当前实现看，它不具备外挂功能。\r\n\r\n"
+            L"但本程序不是 Valve、Steam、完美世界或任何赛事平台的官方软件，也没有获得官方合规认证。"
+            L"平台规则和判定方式可能变化，因此无法承诺在所有平台、赛事或未来版本中一定被允许；"
+            L"使用前请自行确认所在平台和赛事规则。\r\n\r\n"
+            L"测试阶段提示\r\n"
+            L"当前版本仍在测试。死亡检测、切换窗口和下一回合切回可能受网络、全屏模式、系统权限"
+            L"或游戏更新影响而失败或延迟。不建议正在排位、冲分或重视比赛结果的玩家使用，"
+            L"建议先在休闲模式或练习环境中测试。\r\n\r\n"
+            L"隐私与网络\r\n"
+            L"监听服务只绑定 127.0.0.1:3000，不接受局域网或互联网连接。"
+            L"设置保存在当前用户的 %LOCALAPPDATA%\\CSMoyu\\settings.ini。";
+        HWND content = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", helpText,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+            24, 62, 532, 298, hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(content, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
+        HWND close = CreateWindowExW(0, L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            456, 374, 100, 34, hwnd, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(close, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == 1) { DestroyWindow(hwnd); return 0; }
+        break;
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_NCDESTROY: g.helpWindow = nullptr; return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+
+void ShowHelp() {
+    if (g.helpWindow) {
+        ShowWindow(g.helpWindow, SW_RESTORE);
+        SetForegroundWindow(g.helpWindow);
+        return;
+    }
+    RECT desired{0, 0, 580, 440};
+    AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE, 0);
+    g.helpWindow = CreateWindowExW(WS_EX_DLGMODALFRAME, kHelpClassName, L"CS2 摸鱼切换器 - 帮助",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, desired.right - desired.left, desired.bottom - desired.top,
+        g.window, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (g.helpWindow) ShowWindow(g.helpWindow, SW_SHOW);
 }
 
 HWND AddControl(const wchar_t* klass, const wchar_t* text, DWORD style,
@@ -739,6 +997,7 @@ void CreateUi(HWND hwnd) {
 
     HWND heading = AddControl(L"STATIC", L"CS2 摸鱼切换器", SS_LEFT, 28, 22, 400, 34, 0);
     SendMessageW(heading, WM_SETFONT, reinterpret_cast<WPARAM>(g.titleFont), TRUE);
+    AddControl(L"BUTTON", L"帮助", BS_PUSHBUTTON | WS_TABSTOP, 476, 22, 80, 30, IDC_HELP_BUTTON);
     AddControl(L"STATIC", L"当本机玩家死亡时，立即执行选定动作。", SS_LEFT, 29, 60, 500, 22, 0);
 
     AddControl(L"BUTTON", L" 死亡后的动作 ", BS_GROUPBOX, 22, 94, 536, 178, 0);
@@ -778,8 +1037,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         const int id = LOWORD(wp);
         const int notification = HIWORD(wp);
         if (id == IDC_MODE_PROGRAM || id == IDC_MODE_HOTKEY) {
-            g.settings.programMode = id == IDC_MODE_PROGRAM;
-            SaveSettings(); RefreshControls(); return 0;
+            if (notification == BN_CLICKED) {
+                g.settings.programMode = id == IDC_MODE_PROGRAM;
+                RefreshControls();
+                SaveUiSettings();
+            }
+            return 0;
         }
         if (id == IDC_PAUSE_MUSIC || id == IDC_PAUSE_VIDEO) {
             g.settings.pauseMusic = SendMessageW(g.pauseMusic, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -788,11 +1051,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (id == IDC_BROWSE) { BrowseTarget(); return 0; }
         if (id == IDC_INSTALL) { InstallConfig(); return 0; }
+        if (id == IDC_HELP_BUTTON) { ShowHelp(); return 0; }
         if (id == IDC_START) {
-            wchar_t target[32768]{};
-            GetWindowTextW(g.target, target, 32768);
-            g.settings.target = target;
-            SaveSettings();
+            SaveUiSettings();
             if (g.listening) StopServer(); else StartServer();
             return 0;
         }
@@ -820,7 +1081,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         if (!wp) SetWindowTextW(g.start, L"开始监听");
         return 0;
     }
-    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_QUERYENDSESSION:
+        SaveUiSettings();
+        return TRUE;
+    case WM_CLOSE:
+        SaveUiSettings();
+        DestroyWindow(hwnd);
+        return 0;
     case WM_DESTROY:
         StopServer();
         if (g.oldHotkeyProc && IsWindow(g.hotkey)) SetWindowLongPtrW(g.hotkey, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g.oldHotkeyProc));
@@ -845,6 +1112,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     cls.lpszClassName = kClassName;
     if (!RegisterClassExW(&cls)) return 1;
+
+    WNDCLASSEXW helpCls{sizeof(helpCls)};
+    helpCls.lpfnWndProc = HelpWindowProc;
+    helpCls.hInstance = instance;
+    helpCls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    helpCls.hIcon = cls.hIcon;
+    helpCls.hIconSm = cls.hIconSm;
+    helpCls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    helpCls.lpszClassName = kHelpClassName;
+    if (!RegisterClassExW(&helpCls)) return 1;
 
     RECT desired{0, 0, 580, 505};
     AdjustWindowRectEx(&desired, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);

@@ -23,11 +23,14 @@ try {
         $window = $process.MainWindowHandle
     }
     if ($window -eq [IntPtr]::Zero) { throw 'GUI window not found' }
+    Start-Sleep -Milliseconds 250
     $pauseMusic = [CSMoyuNativeTest]::GetDlgItem($window, 1009)
     $pauseVideo = [CSMoyuNativeTest]::GetDlgItem($window, 1010)
     if ($pauseMusic -eq [IntPtr]::Zero -or $pauseVideo -eq [IntPtr]::Zero) {
         throw 'Media pause checkboxes not found'
     }
+    $helpButton = [CSMoyuNativeTest]::GetDlgItem($window, 1011)
+    if ($helpButton -eq [IntPtr]::Zero) { throw 'Help button not found' }
     $programMode = [CSMoyuNativeTest]::GetDlgItem($window, 1001)
     $target = [CSMoyuNativeTest]::GetDlgItem($window, 1003)
     [void][CSMoyuNativeTest]::SendMessage($programMode, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
@@ -115,5 +118,28 @@ finally {
             [void][CSMoyuNativeTest]::SendMessage($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
         }
         $process.WaitForExit(3000) | Out-Null
+    }
+}
+
+# Closing the first instance must persist the selected radio button, and a new
+# instance must restore it from settings.ini.
+$verifyProcess = Start-Process -FilePath $Exe -PassThru
+try {
+    $verifyWindow = [IntPtr]::Zero
+    for ($attempt = 0; $attempt -lt 20 -and $verifyWindow -eq [IntPtr]::Zero; $attempt++) {
+        Start-Sleep -Milliseconds 100
+        $verifyProcess.Refresh()
+        $verifyWindow = $verifyProcess.MainWindowHandle
+    }
+    if ($verifyWindow -eq [IntPtr]::Zero) { throw 'Persistence check window not found' }
+    $restoredHotkeyMode = [CSMoyuNativeTest]::GetDlgItem($verifyWindow, 1002)
+    $checked = [CSMoyuNativeTest]::SendMessage($restoredHotkeyMode, 0x00F0, [IntPtr]::Zero, [IntPtr]::Zero)
+    if ($checked.ToInt64() -ne 1) { throw 'Radio button selection was not restored after restart' }
+    Write-Output 'PASS: radio button selection persisted across restart'
+}
+finally {
+    if (!$verifyProcess.HasExited -and $verifyWindow -ne [IntPtr]::Zero) {
+        [void][CSMoyuNativeTest]::SendMessage($verifyWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        $verifyProcess.WaitForExit(3000) | Out-Null
     }
 }
