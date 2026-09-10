@@ -2,3 +2,5 @@
 /.vs/
 /out/
 *.user
+/cmake-build-debug-ninja-vs
+/cmake-build-release-ninja-vs

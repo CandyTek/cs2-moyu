@@ -69,6 +69,7 @@ struct AppState {
     std::optional<int> observedRound;
     std::string previousRoundPhase;
     std::string previousMapPhase;
+    bool returnWhenMapGoesLive = false;
     std::chrono::steady_clock::time_point lastPayloadHandled{};
     int returnToGameAttemptsRemaining = 0;
     ReturnReason returnReason = ReturnReason::RoundStarted;
@@ -275,8 +276,15 @@ void HandlePayload(const std::string& json) {
     const auto roundPhase = round ? StringForKey(*round, "phase") : std::nullopt;
     if (currentRound) g.observedRound = currentRound;
 
-    const bool warmupEnded = mapPhase && *mapPhase == "live" && g.previousMapPhase == "warmup";
+    // A new match does not always deliver adjacent "warmup" and "live"
+    // payloads. Remember the intent across intervening/missed phase updates;
+    // gameover -> live is also enough to prove that a new match has started.
+    if (mapPhase && (*mapPhase == "warmup" || *mapPhase == "gameover"))
+        g.returnWhenMapGoesLive = true;
+    const bool warmupEnded = mapPhase && *mapPhase == "live" &&
+        g.previousMapPhase != "live" && g.returnWhenMapGoesLive;
     if (warmupEnded) {
+        g.returnWhenMapGoesLive = false;
         g.waitingForNextRound = false;
         g.deathRound.reset();
         PostMessageW(g.window, WM_GSI_EVENT, static_cast<WPARAM>(GsiEvent::WarmupEnded), 0);
@@ -426,6 +434,7 @@ void StartServer() {
     g.observedRound.reset();
     g.previousRoundPhase.clear();
     g.previousMapPhase.clear();
+    g.returnWhenMapGoesLive = false;
     g.lastPayloadHandled = {};
     g.listening = true;
     SetWindowTextW(g.start, L"停止监听");
